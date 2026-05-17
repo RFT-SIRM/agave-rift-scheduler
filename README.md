@@ -26,11 +26,9 @@ Technical visualization of the **Rift Hybrid** scheduler architecture and reposi
 
 ![Rift Hybrid Architecture](hybrid_architecture.png)
 
-```
-agave-rift-scheduler/
-├── 🚀 rift_hybrid_scheduler.rs  # Core Production Logic (Main implementation)
-├── 🧪 rift_scheduler.rs         # Legacy DAG-oriented experiment
-└── 📜 README.md                 # System documentation & Architecture
+* 🚀 **rift_hybrid_scheduler.rs** — Core Production Logic (Main implementation)
+* 🧪 **rift_scheduler.rs** — Legacy DAG-oriented experiment
+* 📜 **README.md** — System documentation & Architecture
 ### Current Status
 
 - Developed by a single independent researcher
