@@ -25,7 +25,7 @@ agave-rift-scheduler/
 ├── rift_scheduler.rs          # First experimental version (DAG-oriented)
 ├── rift_hybrid_scheduler.rs   # Current main implementation (recommended)
 └── README.md
-text### Current Status
+### Current Status
 
 - Developed by a single independent researcher
 - Fully functional research prototype with complete instrumentation
