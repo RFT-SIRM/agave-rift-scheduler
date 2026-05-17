@@ -20,11 +20,17 @@ It addresses the core weakness of the current `GreedyScheduler`: excessive repea
 
 The scheduler treats account contention as a dynamic field problem rather than purely discrete conflicts, allowing significantly better behavior under sustained high-load scenarios.
 
-### Repository Structure
+## 🧩 System & Repository Structure
+
+Technical visualization of the **Rift Hybrid** scheduler architecture and repository file mapping.
+
+![Rift Hybrid Architecture](hybrid_architecture.png)
+
+```text
 agave-rift-scheduler/
-├── rift_scheduler.rs          # First experimental version (DAG-oriented)
-├── rift_hybrid_scheduler.rs   # Current main implementation (recommended)
-└── README.md
+├── 🚀 rift_hybrid_scheduler.rs  # Core Production Logic (Main implementation)
+├── 🧪 rift_scheduler.rs         # Legacy DAG-oriented experiment
+└── 📜 README.md                 # System documentation & Architecture
 ### Current Status
 
 - Developed by a single independent researcher
