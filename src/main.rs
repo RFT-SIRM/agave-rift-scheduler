@@ -15,14 +15,15 @@ fn main() {
     let summary = scheduler.schedule(&transactions, 12);
 
     println!(
-        "scheduled={} deferred={} scanned={} generation={}",
-        summary.scheduled, summary.deferred, summary.scanned, summary.generation
+        "scheduled={} deferred={} dropped={} scanned={} generation={}",
+        summary.scheduled, summary.deferred, summary.dropped, summary.scanned, summary.generation
     );
     println!(
-        "metrics: passes={} scheduled={} deferred={} conflicts={} hot_accounts={}",
+        "metrics: passes={} scheduled={} deferred={} dropped={} conflicts={} hot_accounts={}",
         scheduler.metrics().scheduler_passes,
         scheduler.metrics().scheduled_txs,
         scheduler.metrics().deferred_txs,
+        scheduler.metrics().dropped_txs,
         scheduler.metrics().lock_conflicts,
         scheduler.metrics().hot_accounts
     );
