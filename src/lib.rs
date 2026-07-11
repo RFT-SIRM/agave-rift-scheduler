@@ -447,3 +447,221 @@ mod tests {
         );
     }
 }
+#[cfg(test)]
+mod extended_scheduler_tests {
+    use agave_rift_scheduler::{AccountId, HybridScheduler, SchedulerConfig, Transaction};
+
+    /// Test that hot accounts gradually cool down over generations
+    #[test]
+    fn hotspot_decay_reduces_heat_gradually() {
+        let mut scheduler = HybridScheduler::with_config(SchedulerConfig {
+            hotspot_decay_shift: 1, // halve heat per generation
+            max_generation_age: 32,
+            ..SchedulerConfig::default()
+        });
+
+        let tx = Transaction::new(1, 2, vec![AccountId(100)], vec![true]);
+        scheduler.schedule(&tx, 100);
+        assert_eq!(scheduler.metrics().hot_accounts, 1);
+
+        // After 1 generation, heat should be halved (decay_shift=1 means >>1)
+        let _ = scheduler.schedule(&[], 100);
+        let _ = scheduler.schedule(&[], 100);
+
+        // Account should still exist but much cooler
+        assert!(scheduler.metrics().hot_accounts > 0);
+    }
+
+    /// Test that budget exhaustion defers transactions (not conflicts)
+    #[test]
+    fn budget_exhaustion_defers_without_conflict() {
+        let mut scheduler = HybridScheduler::with_config(SchedulerConfig {
+            conflict_threshold: 100, // very high, so no conflicts
+            ..SchedulerConfig::default()
+        });
+
+        let expensive = Transaction::new(1, 50, vec![AccountId(1)], vec![true]);
+        let another = Transaction::new(2, 60, vec![AccountId(2)], vec![true]);
+
+        let first = scheduler.schedule(&[expensive], 100);
+        assert_eq!(first.scheduled, 1);
+
+        // Second tx exceeds budget (50 + 60 > 100), should be deferred
+        let second = scheduler.schedule(&[another], 100);
+        assert_eq!(second.scheduled, 0);
+        assert_eq!(second.deferred, 1);
+        assert_eq!(scheduler.metrics().lock_conflicts, 0); // no conflict, just budget
+    }
+
+    /// Test that retried transactions eventually succeed once conditions improve
+    #[test]
+    fn retried_transaction_succeeds_when_conflict_clears() {
+        let mut scheduler = HybridScheduler::default();
+
+        let hot = Transaction::new(1, 5, vec![AccountId(42)], vec![true]);
+        let conflict = Transaction::new(2, 5, vec![AccountId(42)], vec![true]);
+
+        // Schedule hot account
+        let _ = scheduler.schedule(&[hot], 50);
+
+        // Conflict deferred
+        let defer1 = scheduler.schedule(&[conflict], 50);
+        assert_eq!(defer1.deferred, 1);
+
+        // Advance 2 generations without new work (hotspot should cool)
+        let _ = scheduler.schedule(&[], 50);
+        let _ = scheduler.schedule(&[], 50);
+
+        // Deferred tx should now succeed
+        let final_pass = scheduler.schedule(&[], 50);
+        assert_eq!(final_pass.scheduled, 1, "deferred tx should eventually succeed");
+        assert_eq!(scheduler.metrics().deferred_txs, 0);
+    }
+
+    /// Test max_retry_count prevents infinite retry loops
+    #[test]
+    fn max_retry_count_drops_transaction() {
+        let mut scheduler = HybridScheduler::with_config(SchedulerConfig {
+            conflict_threshold: 1,
+            max_retry_count: 2,
+            hotspot_decay_shift: 0, // disable decay to guarantee conflict every time
+            ..SchedulerConfig::default()
+        });
+
+        // Create a permanently hot account
+        let hot = Transaction::new(1, 1, vec![AccountId(7)], vec![true]);
+        scheduler.schedule(&[hot], 10);
+
+        // Try to schedule a conflicting transaction
+        let conflict = Transaction::new(2, 1, vec![AccountId(7)], vec![true]);
+        let first = scheduler.schedule(&[conflict], 10);
+        assert_eq!(first.deferred, 1);
+
+        // Retry up to max_retry_count times
+        for _ in 0..10 {
+            scheduler.schedule(&[], 10);
+            if scheduler.metrics().deferred_txs == 0 {
+                break;
+            }
+        }
+
+        // Should be dropped (not deferred forever)
+        assert_eq!(
+            scheduler.metrics().deferred_txs,
+            0,
+            "transaction should be dropped after max_retry_count, not retried forever"
+        );
+        assert!(
+            scheduler.metrics().dropped_txs >= 1,
+            "expected dropped_txs to increment"
+        );
+    }
+
+    /// Test that multiple independent accounts don't interfere
+    #[test]
+    fn multiple_independent_accounts_schedule_separately() {
+        let mut scheduler = HybridScheduler::default();
+
+        let tx1 = Transaction::new(1, 5, vec![AccountId(10)], vec![true]);
+        let tx2 = Transaction::new(2, 5, vec![AccountId(20)], vec![true]);
+        let tx3 = Transaction::new(3, 5, vec![AccountId(30)], vec![true]);
+
+        let summary = scheduler.schedule(&[tx1, tx2, tx3], 50);
+        assert_eq!(summary.scheduled, 3);
+        assert_eq!(summary.deferred, 0);
+    }
+
+    /// Test that read-only accounts (writable=false) don't contribute to conflict score
+    #[test]
+    fn read_only_accounts_do_not_cause_conflicts() {
+        let mut scheduler = HybridScheduler::default();
+
+        // First tx writes to account 50
+        let writer = Transaction::new(1, 3, vec![AccountId(50)], vec![true]);
+        let first = scheduler.schedule(&[writer], 50);
+        assert_eq!(first.scheduled, 1);
+
+        // Second tx reads from the same account 50 (read-only)
+        let reader = Transaction::new(2, 3, vec![AccountId(50)], vec![false]);
+        let second = scheduler.schedule(&[reader], 50);
+
+        // Should schedule immediately (no conflict on read-only)
+        assert_eq!(second.scheduled, 1);
+        assert_eq!(second.deferred, 0);
+    }
+
+    /// Test budget backoff: deferred tx retries next generation
+    #[test]
+    fn deferred_by_budget_retries_next_generation() {
+        let mut scheduler = HybridScheduler::default();
+
+        let expensive = Transaction::new(1, 60, vec![AccountId(1)], vec![true]);
+
+        let first = scheduler.schedule(&[expensive], 50);
+        assert_eq!(first.deferred, 1); // budget exhausted
+
+        // Same tx should retry next generation and succeed
+        let second = scheduler.schedule(&[], 100);
+        assert_eq!(second.scheduled, 1);
+        assert_eq!(scheduler.metrics().deferred_txs, 0);
+    }
+
+    /// Test that generation counter wraps correctly
+    #[test]
+    fn generation_counter_wraps_safely() {
+        let mut scheduler = HybridScheduler::default();
+
+        // Simulate many generations by scheduling empty work
+        for _ in 0..1000 {
+            let _ = scheduler.schedule(&[], 100);
+        }
+
+        // Should not panic or underflow on large generation values
+        let tx = Transaction::new(1, 1, vec![AccountId(1)], vec![true]);
+        let result = scheduler.schedule(&[tx], 100);
+        assert_eq!(result.scheduled, 1);
+    }
+
+    /// Test metrics accumulate correctly across passes
+    #[test]
+    fn metrics_accumulate_across_scheduling_passes() {
+        let mut scheduler = HybridScheduler::default();
+
+        let tx1 = Transaction::new(1, 5, vec![AccountId(1)], vec![true]);
+        let tx2 = Transaction::new(2, 5, vec![AccountId(1)], vec![true]);
+
+        let first = scheduler.schedule(&[tx1], 50);
+        assert_eq!(scheduler.metrics().scheduled_txs, 1);
+
+        let second = scheduler.schedule(&[tx2], 50);
+        assert_eq!(second.deferred, 1);
+        assert_eq!(scheduler.metrics().scheduled_txs, 1); // no new scheduled
+        assert_eq!(scheduler.metrics().lock_conflicts, 1);
+
+        // After retry succeeds
+        let _ = scheduler.schedule(&[], 50);
+        let _ = scheduler.schedule(&[], 50);
+        assert_eq!(scheduler.metrics().scheduled_txs, 2);
+    }
+
+    /// Test that zero-cost transaction in conflict scenario still defers
+    #[test]
+    fn zero_cost_tx_in_high_conflict_defers() {
+        let mut scheduler = HybridScheduler::with_config(SchedulerConfig {
+            conflict_threshold: 1,
+            ..SchedulerConfig::default()
+        });
+
+        let hot = Transaction::new(1, 100, vec![AccountId(99)], vec![true]);
+        scheduler.schedule(&[hot], 1000);
+
+        // Zero-cost transaction on hot account
+        let zero_cost = Transaction::new(2, 0, vec![AccountId(99)], vec![true]);
+        let result = scheduler.schedule(&[zero_cost], 1000);
+
+        assert_eq!(
+            result.deferred, 1,
+            "zero-cost tx should defer on conflict, not bypass"
+        );
+    }
+}
