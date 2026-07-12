@@ -463,7 +463,8 @@ mod extended_scheduler_tests {
         });
 
         let tx = Transaction::new(1, 2, vec![AccountId(100)], vec![true]);
-        scheduler.schedule(&tx, 100);
+        scheduler.schedule(&[tx], 100);
+
         assert_eq!(scheduler.metrics().hot_accounts, 1);
 
         // After 1 generation, heat should be halved (decay_shift=1 means >>1)
