@@ -449,7 +449,9 @@ mod tests {
 }
 #[cfg(test)]
 mod extended_scheduler_tests {
-    use agave_rift_scheduler::{AccountId, HybridScheduler, SchedulerConfig, Transaction};
+    use super::{AccountId, HybridScheduler, SchedulerConfig, Transaction};
+
+
 
     /// Test that hot accounts gradually cool down over generations
     #[test]
