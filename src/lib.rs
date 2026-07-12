@@ -512,9 +512,13 @@ mod extended_scheduler_tests {
         let _ = scheduler.schedule(&[], 50);
         let _ = scheduler.schedule(&[], 50);
 
-        // Deferred tx should now succeed
-        let final_pass = scheduler.schedule(&[], 50);
-        assert_eq!(final_pass.scheduled, 1, "deferred tx should eventually succeed");
+            // Deferred tx should now succeed
+    let final_pass = scheduler.schedule(&[], 50);
+    assert_eq!(
+        final_pass.scheduled, 1,
+        "deferred tx should eventually succeed"
+    );
+
         assert_eq!(scheduler.metrics().deferred_txs, 0);
     }
 
