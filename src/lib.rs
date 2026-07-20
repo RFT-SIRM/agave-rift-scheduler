@@ -451,8 +451,6 @@ mod tests {
 mod extended_scheduler_tests {
     use super::{AccountId, HybridScheduler, SchedulerConfig, Transaction};
 
-
-
     /// Test that hot accounts gradually cool down over generations.
     ///
     /// With default initial_heat=2 and decay_shift=1, after 2 empty passes
@@ -492,14 +490,21 @@ mod extended_scheduler_tests {
         });
 
         let expensive = Transaction::new(1, 50, vec![AccountId(1)], vec![true]);
-        let another   = Transaction::new(2, 60, vec![AccountId(2)], vec![true]);
+        let another = Transaction::new(2, 60, vec![AccountId(2)], vec![true]);
 
         // Single pass, budget=100. expensive(50) schedules first, consuming 50 units.
         // another(60) then needs 60 but only 50 remain — budget exhaustion → deferred.
         let summary = scheduler.schedule(&[expensive, another], 100);
         assert_eq!(summary.scheduled, 1, "only the first tx fits the budget");
-        assert_eq!(summary.deferred,  1, "second tx deferred due to budget exhaustion");
-        assert_eq!(scheduler.metrics().lock_conflicts, 0, "no lock conflicts, only budget");
+        assert_eq!(
+            summary.deferred, 1,
+            "second tx deferred due to budget exhaustion"
+        );
+        assert_eq!(
+            scheduler.metrics().lock_conflicts,
+            0,
+            "no lock conflicts, only budget"
+        );
     }
 
     /// Test that a deferred transaction is retried and succeeds once the
@@ -515,7 +520,7 @@ mod extended_scheduler_tests {
     fn retried_transaction_succeeds_when_conflict_clears() {
         let mut scheduler = HybridScheduler::default();
 
-        let hot      = Transaction::new(1, 5, vec![AccountId(42)], vec![true]);
+        let hot = Transaction::new(1, 5, vec![AccountId(42)], vec![true]);
         let conflict = Transaction::new(2, 5, vec![AccountId(42)], vec![true]);
 
         // Gen1: hot account scheduled and marked.
