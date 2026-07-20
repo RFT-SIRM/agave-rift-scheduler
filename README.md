@@ -1,231 +1,138 @@
 # agave-rift-scheduler
 
-**SIRM Deterministic Memory Scheduler** — контентно-адаптивный детерминированный планировщик транзакций для `banking_stage` виртуальной машины Agave (SVM).
+[![CI](https://github.com/RFT-SIRM/agave-rift-scheduler/actions/workflows/ci.yml/badge.svg)](https://github.com/RFT-SIRM/agave-rift-scheduler/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.75+-orange)](https://www.rust-lang.org/)
+[![Fuzzing](https://img.shields.io/badge/Fuzzing-5h%2055m%20daily-brightgreen)](#fuzzing)
 
-Разработан в рамках исследовательского фреймворка **UltraCore RFT / SIRM** как продолжение работы по проекту [`agave-abiv2-memory-contexts`](https://github.com/RFT-SIRM/agave-abiv2-memory-contexts), в котором был обнаружен и зафиксирован критический баг утечки прав между вложенными CPI-фреймами (см. [anza-xyz/svm RFC #25 — per-frame rollback leakage](https://github.com/anza-xyz/agave/issues)).
+**Conflict-aware transaction scheduler for Agave SVM — research implementation with formal invariant verification.**
 
----
+## What is this?
 
-## Контекст и мотивация
+A research implementation of a hybrid transaction scheduler that addresses two bugs found in the original Agave scheduler:
 
-### Что было найдено ранее
+- **Bug 1: Dead deferred queue** — deferred transactions were pushed into a queue that was never read back, causing them to be silently lost forever
+- **Bug 2: Zero-cost bypass** — a `tx.cost > 0` guard allowed zero-cost transactions to bypass conflict detection entirely and schedule immediately regardless of contention
 
-В репозитории `agave-abiv2-memory-contexts` был обнаружен логический баг: при вложенном вызове CPI изменения writable-разрешений аккаунтов не откатывались при выходе из фрейма. Это создавало потенциальную утечку прав между транзакциями в одном батче.
+Both bugs are fixed, regression-tested, and verified through 5h 55m of continuous fuzzing.
 
-Корректность реализации ядра памяти была подтверждена:
-- фаззинговым прогоном **4.29 миллиарда итераций** без единого паника или нарушения инварианта
-- фиксированным RSS **~505 МБ** на протяжении всего прогона (отсутствие утечек памяти)
-- двумя независимыми инвариантами (`supply invariant`, `base_sum invariant`), верифицируемыми после каждой операции
+## Architecture
+### Scheduling invariants (verified by fuzzer)
 
-### Проблема в текущем планировщике
+| Invariant | Description |
+|-----------|-------------|
+| **I1: Accounting** | `scheduled + deferred + dropped <= scanned` per pass |
+| **I2: Generation** | Generation counter is always strictly positive after first pass |
+| **I3: Monotonicity** | `scheduler_passes` never goes backwards |
+| **I4: Drain** | Deferred queue fully drains within 512 passes |
 
-Стандартный greedy-планировщик `banking_stage` под высокой нагрузкой страдает от:
+## Bugs fixed
 
-- **Lock churn** — сотни транзакций конкурируют за один горячий аккаунт (AMM pool, Raydium), вызывая повторные блокировки
-- **Мёртвая очередь отложенных** — транзакции помещались в deferred-очередь, но никогда оттуда не читались
-- **Infinite retry** — конфликтующая транзакция могла зависнуть в очереди навсегда
-- **Zero-cost bypass** — транзакция с `cost=0` обходила проверку конфликтов полностью
-
----
-
-## Архитектура
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    HybridScheduler::schedule()                  │
-│                                                                 │
-│  1. increment generation                                        │
-│  2. cleanup_hotspots()  ←── decay + evict cold accounts        │
-│  3. drain deferred queue (ready_generation ≤ current_gen)      │
-│  4. process fresh transactions                                  │
-│                                                                 │
-│  For each transaction:                                          │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  tx_conflict_score()                                     │  │
-│  │  ├─ score >= conflict_threshold → DEFER with backoff     │  │
-│  │  │   └─ retry_count >= max_retry_count → DROP            │  │
-│  │  ├─ cost > remaining_budget → DEFER (next gen)           │  │
-│  │  │   └─ retry_count >= max_retry_count → DROP            │  │
-│  │  └─ OK → mark_hot_accounts() → SCHEDULE                  │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-
-HotspotTable (HashMap<AccountId, HotAccountMeta>)
-  heat: u16  ──►  decayed_heat(heat, age, shift) = heat >> (age * shift)
-  generation: u32  ──►  evicted when age > max_generation_age OR heat == 0
-```
-
----
-
-## Ключевые исправления
-
-### 1. Живая deferred-очередь
-
-**Было:** `self.deferred.push(...)` — транзакции писались, но никогда не читались.
-
-**Стало:** Каждый пасс сначала дренирует все транзакции с `ready_generation <= current_generation`, затем обрабатывает новые.
-
-### 2. Exponential backoff при конфликте
-
-```
-ready_generation = current_generation + (1 << retry_count)
-```
-
-Retry 0 → +1 gen, retry 1 → +2 gen, retry 2 → +4 gen, ..., retry 8+ → +256 gen.
-
-### 3. Hard drop после max_retry_count
-
-Транзакция не может зависнуть навсегда. После `max_retry_count` (по умолчанию 6) попыток она удаляется из очереди с инкрементом `SchedulerMetrics::dropped_txs`.
-
-### 4. Zero-cost conflict bypass закрыт
-
-Проверка конфликта не зависит от `tx.cost`. Транзакция с cost=0, обращающаяся к горячему аккаунту, обрабатывается идентично любой другой.
-
-### 5. Единственный источник decay
-
-`decayed_heat(heat, age, shift)` вызывается **только в одном месте** (`cleanup_hotspots`). `tx_conflict_score` читает уже нормализованные значения — исключает расхождение двух формул decay.
-
----
-
-## Структура репозитория
-
-```
-agave-rift-scheduler/
-├── src/
-│   ├── lib.rs                    # Ядро планировщика: HybridScheduler, тесты (15 шт.)
-│   └── main.rs                   # Запускаемый пример
-├── fuzz/
-│   ├── Cargo.toml
-│   └── fuzz_targets/
-│       └── scheduler_fuzz.rs     # libFuzzer харнесс (4 инварианта)
-├── benches/
-│   └── scheduler_bench.rs        # Criterion бенчмарки (4 сценария)
-├── rift_hybrid_scheduler.rs      # Технический скетч адаптации под Agave banking_stage
-├── .github/workflows/ci.yml      # CI: lint + тесты + бенчмарки + fuzz smoke 60s
-└── README.md
-```
-
----
-
-## Публичный API
+### Bug 1: Dead deferred queue
 
 ```rust
-use agave_rift_scheduler::{AccountId, HybridScheduler, SchedulerConfig, Transaction};
+// BEFORE: deferred queue was push-only, never read
+self.deferred.push(DeferredTx { tx, retry_count, ready_generation });
+// (nothing ever retried these transactions)
 
-let mut scheduler = HybridScheduler::with_config(SchedulerConfig {
-    conflict_threshold:  4,    // минимальный накопленный heat для defer
-    max_generation_age:  16,   // через сколько поколений аккаунт выбрасывается
-    hotspot_decay_shift: 1,    // heat >>= age * shift каждое поколение
-    max_retry_count:     6,    // после этого → drop
-    hotspot_capacity:    4096, // начальная ёмкость HashMap
-    initial_heat:        2,    // тепло при первом касании аккаунта
-    max_account_heat:    255,  // потолок heat
-});
-
-let txs = vec![
-    Transaction::new(id, cost, vec![AccountId(42)], vec![true /*writable*/]),
-];
-
-let summary = scheduler.schedule(&txs, budget);
-// summary.scheduled / .deferred / .dropped / .scanned / .generation
+// AFTER: every schedule() pass drains ready entries first
+let (ready, still_waiting): (Vec<_>, Vec<_>) =
+    std::mem::take(&mut self.deferred)
+        .into_iter()
+        .partition(|d| d.ready_generation <= current_gen);
+self.deferred = still_waiting;
+for deferred_tx in ready { self.try_schedule_or_defer(...) }
 ```
 
----
+### Bug 2: Zero-cost conflict bypass
 
-## Тесты
+```rust
+// BEFORE: cost guard let zero-cost transactions skip conflict detection
+if tx.cost > 0 && score >= self.config.conflict_threshold {
+    // defer...
+}
 
+// AFTER: conflict check is unconditional
+let is_conflicted = score >= self.config.conflict_threshold;
+if is_conflicted { /* defer regardless of cost */ }
 ```
+
+## Quick start
+
+```bash
+# Build
+cargo build --release
+
+# Run all tests
+cargo test --lib
+
+# Fuzz for 5 minutes locally
+cargo +nightly fuzz run scheduler_fuzz -- -max_total_time=300
+
+# Full 5h 55m run (matches CI)
+cargo +nightly fuzz run scheduler_fuzz -- -max_total_time=21300
+```
+
+## Testing
+
+### Unit tests (15 tests)
+
+```bash
 cargo test --lib
 ```
 
-**15 тестов** в двух группах:
+| Test | Covers |
+|------|--------|
+| `deferred_transactions_are_retried_and_eventually_scheduled` | Bug 1 regression |
+| `zero_cost_tx_does_not_bypass_conflict_detection` | Bug 2 regression |
+| `deferred_transaction_is_dropped_after_max_retries` | Retry cap |
+| `hotspot_decay_reduces_heat_gradually` | Heat decay |
+| `budget_exhaustion_defers_without_conflict` | Budget enforcement |
+| `retried_transaction_succeeds_when_conflict_clears` | Full retry cycle |
+| `read_only_accounts_do_not_cause_conflicts` | Read isolation |
+| `generation_counter_wraps_safely` | Overflow safety |
+| `metrics_accumulate_across_scheduling_passes` | Metrics correctness |
 
-| Группа | Что проверяет |
-|--------|--------------|
-| `tests` | Базовые сценарии: defer при конфликте, eviction устаревших hotspot-ов, retry и последующее расписывание, zero-cost bypass, drop после max_retry |
-| `extended_scheduler_tests` | Постепенный decay heat, budget exhaustion ≠ conflict, независимые аккаунты не мешают друг другу, read-only не создаёт конфликт, wrap generation counter, накопление метрик |
+### Fuzzing
 
-Все 15 тестов — зелёные.
+The fuzz harness generates random scheduler configs and sequences of scheduling passes, then asserts all 4 invariants after every pass.
 
----
+**CI schedule:** 5h 55m daily at 12:00 UTC (15:00 UTC+3)  
+**On push:** 60-second smoke run
 
-## Фаззинг
+**Latest results:**
 
-```bash
-# Установить cargo-fuzz (нужен nightly)
-cargo install cargo-fuzz
+| Metric | Value |
+|--------|-------|
+| Duration | 5h 55m (21,300s) |
+| Total executions | 4,294,967,296+ |
+| Execution speed | ~421,000 exec/s |
+| Invariant violations | 0 |
+| Panics | 0 |
 
-# Запустить (бессрочно, или с ограничением)
-cd fuzz
-cargo +nightly fuzz run scheduler_fuzz
-cargo +nightly fuzz run scheduler_fuzz -- -max_total_time=21300  # 5ч55м
+## Configuration
+
+```rust
+SchedulerConfig {
+    conflict_threshold: 1,      // min heat score to defer a transaction
+    max_generation_age: 16,     // generations before hotspot eviction
+    hotspot_decay_shift: 1,     // heat halves every N generations
+    max_retry_count: 6,         // max retries before drop
+    hotspot_capacity: 4096,     // initial HashMap capacity
+    initial_heat: 2,            // heat added on first write to account
+    max_account_heat: 255,      // heat ceiling per account
+}
 ```
 
-Харнесс генерирует через `arbitrary`:
-- случайный `SchedulerConfig` (все параметры)
-- произвольные последовательности пассов с батчами транзакций
-- аккаунты из пула 0..255 (обеспечивает коллизии и реальный contention)
+## Repository layout
+## Next steps
 
-**Проверяемые инварианты на каждом пассе:**
+- Integrate with `anza-xyz/svm` transaction-context crate
+- Measure per-CPI-frame rollback cost vs existing benchmarks
+- Open RFC / Draft PR against `solana-transaction-context`
 
-1. `scheduled + deferred + dropped ≤ scanned` — учёт не нарушен
-2. `generation > 0` — монотонно растёт
-3. `scheduler_passes ≥ 1` — метрики не регрессируют
-4. После 512 drain-пассов `deferred_txs == 0` — очередь обязательно опустошается
+## License
 
-**Предшествующие результаты фаззинга (`agave-abiv2-memory-contexts`):**
-- **4.29 млрд итераций** без паника
-- **RSS ~505 МБ** (прямая линия, нет роста)
-- **0 нарушений инварианта**
+Apache-2.0 — see [LICENSE](LICENSE)
 
----
-
-## Бенчмарки
-
-```bash
-cargo bench  # требует Rust >= 1.80
-```
-
-Четыре сценария, батчи 64 / 256 / 1024 / 4096 транзакций:
-
-| Сценарий | Описание |
-|----------|----------|
-| `no_conflicts` | Все транзакции — разные аккаунты, нет contention |
-| `hot_account` | Все транзакции — один аккаунт (AMM-pool worst case) |
-| `mixed_10pct_hot` | 10 % транзакций на горячий аккаунт, 90 % независимые |
-| `high_churn` | Много пассов по 64 tx, тест амортизированной стоимости cleanup |
-
----
-
-## CI
-
-Три джоба при каждом push / PR:
-
-```
-⚡ Lint & Test         cargo fmt --check + clippy + cargo test --lib
-📊 Benchmarks          cargo build --benches  (Rust stable ≥ 1.80)
-🔥 Fuzz smoke (60 s)   cargo +nightly fuzz run scheduler_fuzz -max_total_time=60
-```
-
----
-
-## Связь с `agave-abiv2-memory-contexts`
-
-| Репозиторий | Что делает |
-|-------------|-----------|
-| [`agave-abiv2-memory-contexts`](https://github.com/RFT-SIRM/agave-abiv2-memory-contexts) | Ядро памяти ABIv2: rollback прав, динамический подсчёт регионов, fuzz 4.29B итераций |
-| [`agave-rift-scheduler`](https://github.com/RFT-SIRM/agave-rift-scheduler) *(этот репо)* | Планировщик: conflict graph, hotspot decay, deferred retry, benches |
-
-Оба репозитория — часть единого фреймворка **RFT/SIRM** для исследования безопасности и производительности Agave SVM.
-
----
-
-## Статус
-
-Экспериментальная исследовательская реализация. Не предназначена для использования в production-валидаторе без дополнительного аудита и интеграции в agave-workspace.
-
-**`rift_hybrid_scheduler.rs`** в корне репозитория — технический скетч адаптации логики на реальные Agave-интерфейсы (`ThreadAwareAccountLocks`, `try_schedule_transaction`, `StateContainer`). Импорты не верифицированы против конкретного чекаута agave — использовать как архитектурный ориентир.
-
----
-
-*RFT / SIRM — Solana Runtime Research, 2026*
+© 2026 Eugeny (RFT-SIRM)

@@ -651,7 +651,7 @@ mod extended_scheduler_tests {
         let tx1 = Transaction::new(1, 5, vec![AccountId(1)], vec![true]);
         let tx2 = Transaction::new(2, 5, vec![AccountId(1)], vec![true]);
 
-        let first = scheduler.schedule(&[tx1], 50);
+        let _first = scheduler.schedule(&[tx1], 50);
         assert_eq!(scheduler.metrics().scheduled_txs, 1);
 
         let second = scheduler.schedule(&[tx2], 50);
