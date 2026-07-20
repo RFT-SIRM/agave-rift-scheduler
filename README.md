@@ -1,96 +1,231 @@
 # agave-rift-scheduler
 
-Hybrid contention-aware transaction scheduler for Agave banking_stage.
+**SIRM Deterministic Memory Scheduler** — контентно-адаптивный детерминированный планировщик транзакций для `banking_stage` виртуальной машины Agave (SVM).
 
-## Overview
+Разработан в рамках исследовательского фреймворка **UltraCore RFT / SIRM** как продолжение работы по проекту [`agave-abiv2-memory-contexts`](https://github.com/RFT-SIRM/agave-abiv2-memory-contexts), в котором был обнаружен и зафиксирован критический баг утечки прав между вложенными CPI-фреймами (см. [anza-xyz/svm RFC #25 — per-frame rollback leakage](https://github.com/anza-xyz/agave/issues)).
 
-This repository contains an experimental hybrid scheduler designed to improve transaction scheduling under account contention. The focus is on reducing repeated lock retries, smoothing batch formation, and making hotspot behavior more adaptive.
+---
 
-![Rift Hybrid Architecture](hybrid_architecture.png)
+## Контекст и мотивация
 
-The main implementation lives in [src/lib.rs](src/lib.rs), with a runnable example in [src/main.rs](src/main.rs). The repository is intentionally streamlined around that hybrid scheduler path.
+### Что было найдено ранее
 
-## Motivation
+В репозитории `agave-abiv2-memory-contexts` был обнаружен логический баг: при вложенном вызове CPI изменения writable-разрешений аккаунтов не откатывались при выходе из фрейма. Это создавало потенциальную утечку прав между транзакциями в одном батче.
 
-The standard greedy scheduling flow can waste effort when a small set of accounts becomes hot. Under sustained contention, this can lead to:
+Корректность реализации ядра памяти была подтверждена:
+- фаззинговым прогоном **4.29 миллиарда итераций** без единого паника или нарушения инварианта
+- фиксированным RSS **~505 МБ** на протяжении всего прогона (отсутствие утечек памяти)
+- двумя независимыми инвариантами (`supply invariant`, `base_sum invariant`), верифицируемыми после каждой операции
 
-- excessive lock churn
-- unstable scheduling decisions
-- unnecessary retries
-- reduced throughput and batch efficiency
+### Проблема в текущем планировщике
 
-This project explores a hybrid strategy that preserves the existing scheduler structure while making contention handling more explicit and adaptive.
+Стандартный greedy-планировщик `banking_stage` под высокой нагрузкой страдает от:
 
-## Key Improvements
+- **Lock churn** — сотни транзакций конкурируют за один горячий аккаунт (AMM pool, Raydium), вызывая повторные блокировки
+- **Мёртвая очередь отложенных** — транзакции помещались в deferred-очередь, но никогда оттуда не читались
+- **Infinite retry** — конфликтующая транзакция могла зависнуть в очереди навсегда
+- **Zero-cost bypass** — транзакция с `cost=0` обходила проверку конфликтов полностью
 
-### 1. Generation-Based Hotspot Tracking
+---
 
-Hot accounts are tracked across scheduling generations. Heat decay is
-computed in exactly one place (`decayed_heat`, driven by
-`hotspot_decay_shift`) and applied once per generation in
-`cleanup_hotspots`, so `tx_conflict_score` always reads an
-already-normalized value — no risk of two decay formulas drifting apart.
+## Архитектура
 
-### 2. Fast-Path Conflict Filtering
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    HybridScheduler::schedule()                  │
+│                                                                 │
+│  1. increment generation                                        │
+│  2. cleanup_hotspots()  ←── decay + evict cold accounts        │
+│  3. drain deferred queue (ready_generation ≤ current_gen)      │
+│  4. process fresh transactions                                  │
+│                                                                 │
+│  For each transaction:                                          │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  tx_conflict_score()                                     │  │
+│  │  ├─ score >= conflict_threshold → DEFER with backoff     │  │
+│  │  │   └─ retry_count >= max_retry_count → DROP            │  │
+│  │  ├─ cost > remaining_budget → DEFER (next gen)           │  │
+│  │  │   └─ retry_count >= max_retry_count → DROP            │  │
+│  │  └─ OK → mark_hot_accounts() → SCHEDULE                  │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
 
-Transactions are screened before expensive lock handling. The conflict
-check applies uniformly regardless of a transaction's cost — a zero-cost
-transaction touching a hot account is treated exactly like any other
-transaction touching that account.
+HotspotTable (HashMap<AccountId, HotAccountMeta>)
+  heat: u16  ──►  decayed_heat(heat, age, shift) = heat >> (age * shift)
+  generation: u32  ──►  evicted when age > max_generation_age OR heat == 0
+```
 
-### 3. Deferred Retry with Backoff
+---
 
-Conflicting or budget-exceeding transactions are pushed into a deferred
-queue with generation-based backoff. Each `schedule()` pass first drains
-and retries any deferred transaction whose backoff has elapsed, before
-considering freshly-arrived work. Transactions that still conflict after
-`max_retry_count` retries are dropped (and counted in
-`SchedulerMetrics::dropped_txs`) rather than retried forever.
+## Ключевые исправления
 
-### 4. Progress-Guarded Scheduling Loop
+### 1. Живая deferred-очередь
 
-`SchedulingSummary` and `SchedulerMetrics` expose `scheduled`, `deferred`,
-`dropped`, `scanned`, and `generation`/`hot_accounts` counts so scheduling
-behavior (including the retry-and-drop path) is directly observable and
-testable, rather than being an opaque internal detail.
+**Было:** `self.deferred.push(...)` — транзакции писались, но никогда не читались.
 
-## Design Goals
+**Стало:** Каждый пасс сначала дренирует все транзакции с `ready_generation <= current_generation`, затем обрабатывает новые.
 
-This repository intentionally avoids a large rewrite. The objective is to:
+### 2. Exponential backoff при конфликте
 
-- preserve compatibility with the existing scheduling infrastructure
-- reduce contention-induced retry pressure
-- keep the core implementation compact and readable
-- make behaviors observable through scheduler metrics
+```
+ready_generation = current_generation + (1 << retry_count)
+```
 
-## Current Status
+Retry 0 → +1 gen, retry 1 → +2 gen, retry 2 → +4 gen, ..., retry 8+ → +256 gen.
 
-Experimental research implementation.
+### 3. Hard drop после max_retry_count
 
-`src/lib.rs` is a standalone, fully tested implementation of the hybrid
-scheduling model (contention scoring, hotspot decay, deferred retry with
-backoff, and max-retry drop) — it compiles, passes `cargo fmt --check`,
-and has unit tests covering each of those behaviors, including regression
-tests for previously-identified issues (dead deferred queue, zero-cost
-conflict bypass).
+Транзакция не может зависнуть навсегда. После `max_retry_count` (по умолчанию 6) попыток она удаляется из очереди с инкрементом `SchedulerMetrics::dropped_txs`.
 
-`rift_hybrid_scheduler.rs` at the repository root is a **technical
-reference sketch only** — it is not declared as a module anywhere and is
-not part of this crate's build (`Cargo.toml` only depends on `anyhow`). It
-sketches how the same scheduling/decay/retry logic could be adapted onto
-Agave's actual banking_stage scheduler trait surface, but its Agave-facing
-imports and call signatures (`scheduler_common`, `ThreadAwareAccountLocks`,
-`try_schedule_transaction`, etc.) have not been verified against a
-specific Agave checkout and should be checked against the target version
-before any attempt to compile it inside an actual agave workspace.
+### 4. Zero-cost conflict bypass закрыт
 
-The repository is intended for:
+Проверка конфликта не зависит от `tx.cost`. Транзакция с cost=0, обращающаяся к горячему аккаунту, обрабатывается идентично любой другой.
 
-- scheduler architecture discussion
-- contention-heavy experimentation
-- hybrid scheduling design exploration
-- future integration with broader Agave runtime work
+### 5. Единственный источник decay
 
-## Repository Purpose
+`decayed_heat(heat, age, shift)` вызывается **только в одном месте** (`cleanup_hotspots`). `tx_conflict_score` читает уже нормализованные значения — исключает расхождение двух формул decay.
 
-This repository exists to keep the focus on the hybrid scheduler path and to make the main implementation easier to inspect, compare, and extend.
+---
+
+## Структура репозитория
+
+```
+agave-rift-scheduler/
+├── src/
+│   ├── lib.rs                    # Ядро планировщика: HybridScheduler, тесты (15 шт.)
+│   └── main.rs                   # Запускаемый пример
+├── fuzz/
+│   ├── Cargo.toml
+│   └── fuzz_targets/
+│       └── scheduler_fuzz.rs     # libFuzzer харнесс (4 инварианта)
+├── benches/
+│   └── scheduler_bench.rs        # Criterion бенчмарки (4 сценария)
+├── rift_hybrid_scheduler.rs      # Технический скетч адаптации под Agave banking_stage
+├── .github/workflows/ci.yml      # CI: lint + тесты + бенчмарки + fuzz smoke 60s
+└── README.md
+```
+
+---
+
+## Публичный API
+
+```rust
+use agave_rift_scheduler::{AccountId, HybridScheduler, SchedulerConfig, Transaction};
+
+let mut scheduler = HybridScheduler::with_config(SchedulerConfig {
+    conflict_threshold:  4,    // минимальный накопленный heat для defer
+    max_generation_age:  16,   // через сколько поколений аккаунт выбрасывается
+    hotspot_decay_shift: 1,    // heat >>= age * shift каждое поколение
+    max_retry_count:     6,    // после этого → drop
+    hotspot_capacity:    4096, // начальная ёмкость HashMap
+    initial_heat:        2,    // тепло при первом касании аккаунта
+    max_account_heat:    255,  // потолок heat
+});
+
+let txs = vec![
+    Transaction::new(id, cost, vec![AccountId(42)], vec![true /*writable*/]),
+];
+
+let summary = scheduler.schedule(&txs, budget);
+// summary.scheduled / .deferred / .dropped / .scanned / .generation
+```
+
+---
+
+## Тесты
+
+```
+cargo test --lib
+```
+
+**15 тестов** в двух группах:
+
+| Группа | Что проверяет |
+|--------|--------------|
+| `tests` | Базовые сценарии: defer при конфликте, eviction устаревших hotspot-ов, retry и последующее расписывание, zero-cost bypass, drop после max_retry |
+| `extended_scheduler_tests` | Постепенный decay heat, budget exhaustion ≠ conflict, независимые аккаунты не мешают друг другу, read-only не создаёт конфликт, wrap generation counter, накопление метрик |
+
+Все 15 тестов — зелёные.
+
+---
+
+## Фаззинг
+
+```bash
+# Установить cargo-fuzz (нужен nightly)
+cargo install cargo-fuzz
+
+# Запустить (бессрочно, или с ограничением)
+cd fuzz
+cargo +nightly fuzz run scheduler_fuzz
+cargo +nightly fuzz run scheduler_fuzz -- -max_total_time=21300  # 5ч55м
+```
+
+Харнесс генерирует через `arbitrary`:
+- случайный `SchedulerConfig` (все параметры)
+- произвольные последовательности пассов с батчами транзакций
+- аккаунты из пула 0..255 (обеспечивает коллизии и реальный contention)
+
+**Проверяемые инварианты на каждом пассе:**
+
+1. `scheduled + deferred + dropped ≤ scanned` — учёт не нарушен
+2. `generation > 0` — монотонно растёт
+3. `scheduler_passes ≥ 1` — метрики не регрессируют
+4. После 512 drain-пассов `deferred_txs == 0` — очередь обязательно опустошается
+
+**Предшествующие результаты фаззинга (`agave-abiv2-memory-contexts`):**
+- **4.29 млрд итераций** без паника
+- **RSS ~505 МБ** (прямая линия, нет роста)
+- **0 нарушений инварианта**
+
+---
+
+## Бенчмарки
+
+```bash
+cargo bench  # требует Rust >= 1.80
+```
+
+Четыре сценария, батчи 64 / 256 / 1024 / 4096 транзакций:
+
+| Сценарий | Описание |
+|----------|----------|
+| `no_conflicts` | Все транзакции — разные аккаунты, нет contention |
+| `hot_account` | Все транзакции — один аккаунт (AMM-pool worst case) |
+| `mixed_10pct_hot` | 10 % транзакций на горячий аккаунт, 90 % независимые |
+| `high_churn` | Много пассов по 64 tx, тест амортизированной стоимости cleanup |
+
+---
+
+## CI
+
+Три джоба при каждом push / PR:
+
+```
+⚡ Lint & Test         cargo fmt --check + clippy + cargo test --lib
+📊 Benchmarks          cargo build --benches  (Rust stable ≥ 1.80)
+🔥 Fuzz smoke (60 s)   cargo +nightly fuzz run scheduler_fuzz -max_total_time=60
+```
+
+---
+
+## Связь с `agave-abiv2-memory-contexts`
+
+| Репозиторий | Что делает |
+|-------------|-----------|
+| [`agave-abiv2-memory-contexts`](https://github.com/RFT-SIRM/agave-abiv2-memory-contexts) | Ядро памяти ABIv2: rollback прав, динамический подсчёт регионов, fuzz 4.29B итераций |
+| [`agave-rift-scheduler`](https://github.com/RFT-SIRM/agave-rift-scheduler) *(этот репо)* | Планировщик: conflict graph, hotspot decay, deferred retry, benches |
+
+Оба репозитория — часть единого фреймворка **RFT/SIRM** для исследования безопасности и производительности Agave SVM.
+
+---
+
+## Статус
+
+Экспериментальная исследовательская реализация. Не предназначена для использования в production-валидаторе без дополнительного аудита и интеграции в agave-workspace.
+
+**`rift_hybrid_scheduler.rs`** в корне репозитория — технический скетч адаптации логики на реальные Agave-интерфейсы (`ThreadAwareAccountLocks`, `try_schedule_transaction`, `StateContainer`). Импорты не верифицированы против конкретного чекаута agave — использовать как архитектурный ориентир.
+
+---
+
+*RFT / SIRM — Solana Runtime Research, 2026*

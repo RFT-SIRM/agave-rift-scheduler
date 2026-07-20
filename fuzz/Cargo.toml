@@ -1,0 +1,20 @@
+[package]
+name = "agave-rift-scheduler-fuzz"
+version = "0.0.1"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+agave-rift-scheduler = { path = ".." }
+
+[[bin]]
+name = "scheduler_fuzz"
+path = "fuzz_targets/scheduler_fuzz.rs"
+test = false
+doc = false
+bench = false

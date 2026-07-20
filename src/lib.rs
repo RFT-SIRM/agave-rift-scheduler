@@ -453,75 +453,84 @@ mod extended_scheduler_tests {
 
 
 
-    /// Test that hot accounts gradually cool down over generations
+    /// Test that hot accounts gradually cool down over generations.
+    ///
+    /// With default initial_heat=2 and decay_shift=1, after 2 empty passes
+    /// the age becomes 2, so heat = 2 >> 2 = 0 and the account is evicted.
+    /// Use initial_heat=40 so decay is observable: 40 → 20 → 10 → still hot.
     #[test]
     fn hotspot_decay_reduces_heat_gradually() {
         let mut scheduler = HybridScheduler::with_config(SchedulerConfig {
-            hotspot_decay_shift: 1, // halve heat per generation
+            hotspot_decay_shift: 1,
             max_generation_age: 32,
+            initial_heat: 40,
             ..SchedulerConfig::default()
         });
 
         let tx = Transaction::new(1, 2, vec![AccountId(100)], vec![true]);
         scheduler.schedule(&[tx], 100);
-
         assert_eq!(scheduler.metrics().hot_accounts, 1);
 
-        // After 1 generation, heat should be halved (decay_shift=1 means >>1)
+        // Gen+1: age=1, heat = 40 >> 1 = 20 — still tracked.
         let _ = scheduler.schedule(&[], 100);
-        let _ = scheduler.schedule(&[], 100);
+        assert_eq!(scheduler.metrics().hot_accounts, 1, "hot after 1 pass");
 
-        // Account should still exist but much cooler
-        assert!(scheduler.metrics().hot_accounts > 0);
+        // Gen+2: heat = 20 >> 1 = 10 — still tracked.
+        let _ = scheduler.schedule(&[], 100);
+        assert!(scheduler.metrics().hot_accounts > 0, "hot after 2 passes");
     }
 
-    /// Test that budget exhaustion defers transactions (not conflicts)
+    /// Test that budget exhaustion defers transactions (not conflicts).
+    ///
+    /// Budget is per scheduling-pass and resets each call.
+    /// Both txs must be in the SAME pass so the second sees a depleted budget.
     #[test]
     fn budget_exhaustion_defers_without_conflict() {
         let mut scheduler = HybridScheduler::with_config(SchedulerConfig {
-            conflict_threshold: 100, // very high, so no conflicts
+            conflict_threshold: 100, // very high — no conflicts
             ..SchedulerConfig::default()
         });
 
         let expensive = Transaction::new(1, 50, vec![AccountId(1)], vec![true]);
-        let another = Transaction::new(2, 60, vec![AccountId(2)], vec![true]);
+        let another   = Transaction::new(2, 60, vec![AccountId(2)], vec![true]);
 
-        let first = scheduler.schedule(&[expensive], 100);
-        assert_eq!(first.scheduled, 1);
-
-        // Second tx exceeds budget (50 + 60 > 100), should be deferred
-        let second = scheduler.schedule(&[another], 100);
-        assert_eq!(second.scheduled, 0);
-        assert_eq!(second.deferred, 1);
-        assert_eq!(scheduler.metrics().lock_conflicts, 0); // no conflict, just budget
+        // Single pass, budget=100. expensive(50) schedules first, consuming 50 units.
+        // another(60) then needs 60 but only 50 remain — budget exhaustion → deferred.
+        let summary = scheduler.schedule(&[expensive, another], 100);
+        assert_eq!(summary.scheduled, 1, "only the first tx fits the budget");
+        assert_eq!(summary.deferred,  1, "second tx deferred due to budget exhaustion");
+        assert_eq!(scheduler.metrics().lock_conflicts, 0, "no lock conflicts, only budget");
     }
 
-    /// Test that retried transactions eventually succeed once conditions improve
+    /// Test that a deferred transaction is retried and succeeds once the
+    /// hot account cools down.
+    ///
+    /// Timeline (default: initial_heat=2, decay_shift=1, threshold=1):
+    ///   Gen1: schedule([hot])      -> mark_hot(42, heat=2), scheduled=1
+    ///   Gen2: schedule([conflict]) -> score=2>=1, conflict, backoff=1<<0=1,
+    ///                                 ready_gen=3, deferred=1
+    ///   Gen3: schedule([])         -> cleanup: age=2, heat=2>>2=0 → evicted
+    ///                                 drain ready (gen=3<=3) → score=0 → SCHEDULED
     #[test]
     fn retried_transaction_succeeds_when_conflict_clears() {
         let mut scheduler = HybridScheduler::default();
 
-        let hot = Transaction::new(1, 5, vec![AccountId(42)], vec![true]);
+        let hot      = Transaction::new(1, 5, vec![AccountId(42)], vec![true]);
         let conflict = Transaction::new(2, 5, vec![AccountId(42)], vec![true]);
 
-        // Schedule hot account
+        // Gen1: hot account scheduled and marked.
         let _ = scheduler.schedule(&[hot], 50);
 
-        // Conflict deferred
+        // Gen2: conflict detected, deferred with backoff=1 (ready at gen3).
         let defer1 = scheduler.schedule(&[conflict], 50);
         assert_eq!(defer1.deferred, 1);
 
-        // Advance 2 generations without new work (hotspot should cool)
-        let _ = scheduler.schedule(&[], 50);
-        let _ = scheduler.schedule(&[], 50);
-
-            // Deferred tx should now succeed
+        // Gen3: backoff elapsed, hotspot decayed to 0 → deferred tx scheduled.
         let final_pass = scheduler.schedule(&[], 50);
         assert_eq!(
-        final_pass.scheduled, 1,
-        "deferred tx should eventually succeed"
-    );
-
+            final_pass.scheduled, 1,
+            "deferred tx should be scheduled once the hotspot cools"
+        );
         assert_eq!(scheduler.metrics().deferred_txs, 0);
     }
 
