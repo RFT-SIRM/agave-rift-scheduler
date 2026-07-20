@@ -1,0 +1,20 @@
+name: Fuzz 5h 55m (daily)
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  fuzz-daily:
+    name: Fuzz 5h 55m
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run scheduler_fuzz 5h 55m
+        working-directory: fuzz
+        run: cargo +nightly fuzz run scheduler_fuzz -- -max_total_time=21300
