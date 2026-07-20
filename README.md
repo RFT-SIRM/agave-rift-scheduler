@@ -191,7 +191,7 @@ Coverage typically stabilises within the first 100,000 executions (`cov: ~420 ft
 
 These figures describe the fuzz harness on an isolated in-memory struct. They are not transaction throughput figures and must not be compared to validator TPS benchmarks.
 
-### Native machine (Apple Silicon M1)
+### Native machine (Apple Silicon M4)
 
 | Metric | Value |
 |--------|-------|
